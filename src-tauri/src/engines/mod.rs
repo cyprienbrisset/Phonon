@@ -1,5 +1,7 @@
-pub mod traits;
+pub mod error;
 pub mod openvino;
+pub mod traits;
 
-pub use traits::*;
-pub use openvino::*;
+pub use error::EngineError;
+pub use openvino::OpenVINOEngine;
+pub use traits::SpeechEngine;

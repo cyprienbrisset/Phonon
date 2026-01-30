@@ -1,50 +1,71 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
-import "./App.css";
+import { useEffect, useState } from 'react';
+import { Settings, History } from 'lucide-react';
+import { DictationPanel } from './components/DictationPanel';
+import { TranscriptionHistory } from './components/TranscriptionHistory';
+import { SettingsPanel } from './components/SettingsPanel';
+import { useSettingsStore } from './stores/settingsStore';
+
+type Tab = 'dictation' | 'history';
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [activeTab, setActiveTab] = useState<Tab>('dictation');
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const { loadSettings } = useSettingsStore();
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+      {/* Header */}
+      <header className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700 px-4 py-3">
+        <div className="flex justify-between items-center">
+          <h1 className="text-xl font-bold text-gray-900 dark:text-white">WakaScribe</h1>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
+          >
+            <Settings className="w-5 h-5 text-gray-600 dark:text-gray-300" />
+          </button>
+        </div>
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
+      {/* Tabs */}
+      <nav className="bg-white dark:bg-gray-800 border-b border-gray-200 dark:border-gray-700">
+        <div className="flex">
+          <button
+            onClick={() => setActiveTab('dictation')}
+            className={`flex-1 py-3 text-center font-medium transition-colors ${
+              activeTab === 'dictation'
+                ? 'text-blue-600 border-b-2 border-blue-600'
+                : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            Dictée
+          </button>
+          <button
+            onClick={() => setActiveTab('history')}
+            className={`flex-1 py-3 text-center font-medium transition-colors flex items-center justify-center gap-2 ${
+              activeTab === 'history'
+                ? 'text-blue-600 border-b-2 border-blue-600'
+                : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            <History className="w-4 h-4" />
+            Historique
+          </button>
+        </div>
+      </nav>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      {/* Content */}
+      <main className="container mx-auto max-w-2xl">
+        {activeTab === 'dictation' ? <DictationPanel /> : <TranscriptionHistory />}
+      </main>
+
+      {/* Settings Panel */}
+      <SettingsPanel isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </div>
   );
 }
 

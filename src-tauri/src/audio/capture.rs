@@ -1,0 +1,106 @@
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, Host, Stream, StreamConfig};
+use std::sync::{Arc, Mutex};
+
+use crate::types::AudioDevice;
+
+pub struct AudioCapture {
+    stream: Option<Stream>,
+    buffer: Arc<Mutex<Vec<f32>>>,
+    sample_rate: u32,
+}
+
+impl AudioCapture {
+    pub fn list_devices() -> Result<Vec<AudioDevice>, String> {
+        let host = cpal::default_host();
+        let default_device = host.default_input_device();
+        let default_name = default_device.and_then(|d| d.name().ok());
+
+        let devices: Vec<AudioDevice> = host
+            .input_devices()
+            .map_err(|e| e.to_string())?
+            .filter_map(|device| {
+                let name = device.name().ok()?;
+                Some(AudioDevice {
+                    id: name.clone(),
+                    name: name.clone(),
+                    is_default: Some(&name) == default_name.as_ref(),
+                })
+            })
+            .collect();
+
+        Ok(devices)
+    }
+
+    pub fn new(device_id: Option<&str>) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = Self::get_device(&host, device_id)?;
+        let config = device.default_input_config().map_err(|e| e.to_string())?;
+
+        Ok(Self {
+            stream: None,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            sample_rate: config.sample_rate().0,
+        })
+    }
+
+    fn get_device(host: &Host, device_id: Option<&str>) -> Result<Device, String> {
+        match device_id {
+            Some(id) => host
+                .input_devices()
+                .map_err(|e| e.to_string())?
+                .find(|d| d.name().ok().as_deref() == Some(id))
+                .ok_or_else(|| format!("Device '{}' not found", id)),
+            None => host
+                .default_input_device()
+                .ok_or_else(|| "No default input device".to_string()),
+        }
+    }
+
+    pub fn start(&mut self, device_id: Option<&str>) -> Result<(), String> {
+        let host = cpal::default_host();
+        let device = Self::get_device(&host, device_id)?;
+        let config = device.default_input_config().map_err(|e| e.to_string())?;
+
+        self.sample_rate = config.sample_rate().0;
+        self.buffer.lock().unwrap().clear();
+
+        let buffer = self.buffer.clone();
+        let config: StreamConfig = config.into();
+
+        let stream = device
+            .build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mut buf = buffer.lock().unwrap();
+                    buf.extend_from_slice(data);
+                },
+                |err| {
+                    log::error!("Audio stream error: {}", err);
+                },
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+
+        stream.play().map_err(|e| e.to_string())?;
+        self.stream = Some(stream);
+
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<(Vec<f32>, u32), String> {
+        self.stream = None;
+        let buffer = self.buffer.lock().unwrap().clone();
+        let sample_rate = self.sample_rate;
+        self.buffer.lock().unwrap().clear();
+        Ok((buffer, sample_rate))
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}

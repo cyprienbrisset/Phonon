@@ -4,6 +4,7 @@ import { DictationPanel } from './components/DictationPanel';
 import { TranscriptionHistory } from './components/TranscriptionHistory';
 import { SettingsPanel } from './components/SettingsPanel';
 import { useSettingsStore } from './stores/settingsStore';
+import { useHotkeys } from './hooks/useHotkeys';
 
 type Tab = 'dictation' | 'history';
 
@@ -11,6 +12,8 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dictation');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const { loadSettings } = useSettingsStore();
+
+  useHotkeys();
 
   useEffect(() => {
     loadSettings();

@@ -1,4 +1,8 @@
+mod audio;
+mod storage;
 mod types;
+
+pub use audio::AudioCapture;
 pub use types::*;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

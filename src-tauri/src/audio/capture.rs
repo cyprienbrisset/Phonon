@@ -103,4 +103,10 @@ impl AudioCapture {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
+
+    /// Retourne un snapshot de l'audio accumulé sans arrêter l'enregistrement
+    pub fn get_audio_snapshot(&self) -> (Vec<f32>, u32) {
+        let buffer = self.buffer.lock().unwrap().clone();
+        (buffer, self.sample_rate)
+    }
 }

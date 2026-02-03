@@ -9,6 +9,18 @@ import { useHotkeys } from './hooks/useHotkeys';
 
 type Tab = 'dictation' | 'history';
 
+// Formatte un raccourci clavier pour l'affichage
+function formatHotkey(hotkey: string): string {
+  return hotkey
+    .replace('CommandOrControl', '⌘')
+    .replace('Command', '⌘')
+    .replace('Control', 'Ctrl')
+    .replace('Shift', '⇧')
+    .replace('Alt', '⌥')
+    .replace('Space', 'Espace')
+    .replace(/\+/g, '+');
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dictation');
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -125,7 +137,7 @@ function App() {
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <span className="kbd">⌘+Shift+Space</span>
+          <span className="kbd">{formatHotkey(settings?.hotkey_push_to_talk || 'CommandOrControl+Shift+Space')}</span>
           <span className="text-[0.65rem] text-[var(--text-muted)]">Push-to-talk</span>
         </div>
       </footer>

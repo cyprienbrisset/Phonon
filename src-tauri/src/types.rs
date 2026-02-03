@@ -89,6 +89,7 @@ pub struct TranscriptionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppSettings {
     pub microphone_id: Option<String>,
     pub hotkey_push_to_talk: String,
@@ -104,13 +105,32 @@ pub struct AppSettings {
     pub llm_mode: LlmMode,
     pub voice_commands_enabled: bool,
     pub dictation_mode: DictationMode,
+    #[serde(default = "default_true")]
     pub streaming_enabled: bool,
+    #[serde(default = "default_true")]
     pub auto_paste_enabled: bool,
+    #[serde(default)]
     pub floating_window_enabled: bool,
+    #[serde(default)]
     pub floating_window_position: Option<(i32, i32)>,
+    #[serde(default)]
     pub translation_enabled: bool,
+    #[serde(default = "default_translation_language")]
     pub translation_target_language: String,
+    #[serde(default = "default_hotkey_translate")]
     pub hotkey_translate: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_translation_language() -> String {
+    "en".to_string()
+}
+
+fn default_hotkey_translate() -> String {
+    "CommandOrControl+Shift+T".to_string()
 }
 
 impl Default for AppSettings {

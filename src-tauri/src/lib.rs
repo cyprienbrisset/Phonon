@@ -280,6 +280,11 @@ pub fn run() {
             commands::delete_model,
             commands::switch_model,
             commands::is_engine_ready,
+            commands::set_groq_api_key,
+            commands::get_groq_api_key,
+            commands::has_groq_api_key,
+            commands::validate_groq_api_key,
+            commands::delete_groq_api_key,
         ])
         .setup(|app| {
             // Initialiser l'état avec le moteur Whisper

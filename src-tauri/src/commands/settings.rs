@@ -18,7 +18,9 @@ pub fn update_settings(
 ) -> Result<(), String> {
     // Récupérer les anciens settings pour comparer les raccourcis
     let old_settings = state.settings.read().map_err(|e| e.to_string())?.clone();
-    let hotkey_changed = old_settings.hotkey_push_to_talk != new_settings.hotkey_push_to_talk;
+    let ptt_hotkey_changed = old_settings.hotkey_push_to_talk != new_settings.hotkey_push_to_talk;
+    let translate_hotkey_changed = old_settings.hotkey_translate != new_settings.hotkey_translate;
+    let translation_enabled_changed = old_settings.translation_enabled != new_settings.translation_enabled;
 
     // Sauvegarder les nouveaux settings
     config::save_settings(&new_settings)?;
@@ -29,18 +31,38 @@ pub fn update_settings(
         *settings = new_settings.clone();
     }
 
-    // Si le raccourci a changé, le réenregistrer
-    if hotkey_changed {
-        if let Err(e) = update_ptt_shortcut(&app, &old_settings.hotkey_push_to_talk, &new_settings.hotkey_push_to_talk) {
-            log::warn!("Failed to update shortcut dynamically: {}. Restart may be required.", e);
+    // Si le raccourci PTT a changé, le réenregistrer
+    if ptt_hotkey_changed {
+        if let Err(e) = update_shortcut(&app, &old_settings.hotkey_push_to_talk, &new_settings.hotkey_push_to_talk) {
+            log::warn!("Failed to update PTT shortcut: {}. Restart may be required.", e);
+        }
+    }
+
+    // Gérer le raccourci de traduction
+    if translation_enabled_changed || translate_hotkey_changed {
+        // Désenregistrer l'ancien si existait
+        if old_settings.translation_enabled {
+            if let Some(old_shortcut) = parse_hotkey_internal(&old_settings.hotkey_translate) {
+                let _ = app.global_shortcut().unregister(old_shortcut);
+            }
+        }
+        // Enregistrer le nouveau si activé
+        if new_settings.translation_enabled {
+            if let Some(new_shortcut) = parse_hotkey_internal(&new_settings.hotkey_translate) {
+                if let Err(e) = app.global_shortcut().register(new_shortcut) {
+                    log::warn!("Failed to register translate shortcut: {}", e);
+                } else {
+                    log::info!("Translate shortcut registered: {}", new_settings.hotkey_translate);
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-/// Met à jour le raccourci PTT dynamiquement
-fn update_ptt_shortcut(app: &AppHandle, old_hotkey: &str, new_hotkey: &str) -> Result<(), String> {
+/// Met à jour un raccourci dynamiquement
+fn update_shortcut(app: &AppHandle, old_hotkey: &str, new_hotkey: &str) -> Result<(), String> {
     // Parser l'ancien raccourci
     if let Some(old_shortcut) = parse_hotkey_internal(old_hotkey) {
         // Désenregistrer l'ancien

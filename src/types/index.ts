@@ -7,6 +7,21 @@ export interface TranscriptionResult {
   timestamp: number;
 }
 
+export type ModelSize = 'tiny' | 'small' | 'medium';
+
+export interface ModelInfo {
+  size: ModelSize;
+  display_name: string;
+  available: boolean;
+  size_bytes: number;
+}
+
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+  percent: number;
+}
+
 export interface AppSettings {
   microphone_id: string | null;
   hotkey_push_to_talk: string;
@@ -17,6 +32,7 @@ export interface AppSettings {
   minimize_to_tray: boolean;
   auto_copy_to_clipboard: boolean;
   notification_on_complete: boolean;
+  whisper_model: ModelSize;
 }
 
 export interface AudioDevice {

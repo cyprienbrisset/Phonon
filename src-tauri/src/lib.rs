@@ -35,6 +35,9 @@ static IS_PTT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PTT_AUDIO_SENDER: Mutex<Option<mpsc::Sender<PttCommand>>> = Mutex::new(None);
 static PTT_AUDIO_RECEIVER: Mutex<Option<mpsc::Receiver<PttResult>>> = Mutex::new(None);
 
+// Pour le streaming temps réel
+static STREAMING_TEXT: Mutex<String> = Mutex::new(String::new());
+
 // Référence globale au TrayIcon pour changer l'icône
 static TRAY_ICON: Mutex<Option<TrayIcon>> = Mutex::new(None);
 
@@ -46,12 +49,13 @@ static ICON_RECORDING: Mutex<Option<Image<'static>>> = Mutex::new(None);
 enum PttCommand {
     Start,
     Stop,
+    GetSnapshot, // Demande un snapshot de l'audio en cours
 }
 
 #[derive(Debug)]
-struct PttResult {
-    audio: Vec<f32>,
-    sample_rate: u32,
+enum PttResult {
+    AudioComplete { audio: Vec<f32>, sample_rate: u32 },
+    AudioSnapshot { audio: Vec<f32>, sample_rate: u32 },
 }
 
 /// Parse un raccourci clavier depuis un format string (ex: "Ctrl+Shift+R")
@@ -257,10 +261,20 @@ pub fn run() {
                             ShortcutState::Pressed => {
                                 println!("[PTT] Key PRESSED - Starting recording");
                                 if !IS_PTT_ACTIVE.swap(true, Ordering::SeqCst) {
+                                    // Réinitialiser le texte streaming
+                                    if let Ok(mut text) = STREAMING_TEXT.lock() {
+                                        text.clear();
+                                    }
                                     set_tray_recording(true);
                                     start_ptt_recording();
                                     // Émettre l'événement de statut pour le frontend
                                     let _ = app.emit("recording-status", "recording");
+
+                                    // Démarrer le thread de streaming temps réel
+                                    let handle = app.clone();
+                                    std::thread::spawn(move || {
+                                        start_streaming_transcription(&handle);
+                                    });
                                 }
                             }
                             ShortcutState::Released => {
@@ -614,12 +628,19 @@ fn init_ptt_audio_thread() {
                         }
                     }
                 }
+                Ok(PttCommand::GetSnapshot) => {
+                    // Renvoyer un snapshot de l'audio accumulé sans arrêter l'enregistrement
+                    if let Some(ref cap) = capture {
+                        let (audio, sample_rate) = cap.get_audio_snapshot();
+                        let _ = result_tx.send(PttResult::AudioSnapshot { audio, sample_rate });
+                    }
+                }
                 Ok(PttCommand::Stop) => {
                     log::info!("PTT: Stopping audio capture");
                     if let Some(mut cap) = capture.take() {
                         match cap.stop() {
                             Ok((audio, sample_rate)) => {
-                                let _ = result_tx.send(PttResult { audio, sample_rate });
+                                let _ = result_tx.send(PttResult::AudioComplete { audio, sample_rate });
                             }
                             Err(e) => {
                                 log::error!("Failed to stop audio capture: {}", e);
@@ -649,12 +670,201 @@ fn start_ptt_recording() {
     }
 }
 
+/// Streaming temps réel : transcrit et tape le texte pendant l'enregistrement
+fn start_streaming_transcription(app: &tauri::AppHandle) {
+    println!("[STREAMING] Starting streaming transcription");
+
+    // Vérifier si le streaming est activé dans les settings
+    let settings = storage::config::load_settings();
+    if !settings.streaming_enabled {
+        println!("[STREAMING] Streaming disabled in settings");
+        return;
+    }
+
+    // Intervalle entre les transcriptions (en millisecondes)
+    const STREAMING_INTERVAL_MS: u64 = 2500;
+    let mut last_text_len = 0;
+
+    // Boucle de streaming tant que l'enregistrement est actif
+    while IS_PTT_ACTIVE.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(STREAMING_INTERVAL_MS));
+
+        // Vérifier encore si l'enregistrement est actif
+        if !IS_PTT_ACTIVE.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Demander un snapshot audio
+        if let Ok(guard) = PTT_AUDIO_SENDER.lock() {
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(PttCommand::GetSnapshot);
+            }
+        }
+
+        // Attendre le résultat
+        let snapshot = if let Ok(guard) = PTT_AUDIO_RECEIVER.lock() {
+            if let Some(ref receiver) = *guard {
+                match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(PttResult::AudioSnapshot { audio, sample_rate }) => Some((audio, sample_rate)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let (audio_data, sample_rate) = match snapshot {
+            Some(data) => data,
+            None => continue,
+        };
+
+        // Vérifier qu'on a assez d'audio (au moins 1 seconde)
+        let duration = audio_data.len() as f32 / sample_rate as f32;
+        if duration < 1.0 {
+            continue;
+        }
+
+        println!("[STREAMING] Got {} samples ({:.1}s)", audio_data.len(), duration);
+
+        // Resampler si nécessaire
+        let resampled = if sample_rate != TARGET_SAMPLE_RATE {
+            resample_audio(&audio_data, sample_rate, TARGET_SAMPLE_RATE)
+        } else {
+            audio_data
+        };
+
+        // Transcrire
+        let state: tauri::State<'_, AppState> = app.state();
+        let engine_guard = match state.engine.read() {
+            Ok(guard) => guard,
+            Err(_) => continue,
+        };
+        let engine = match engine_guard.as_ref() {
+            Some(e) => e,
+            None => continue,
+        };
+        let result = match engine.transcribe(&resampled, TARGET_SAMPLE_RATE) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("[STREAMING] Transcription error: {}", e);
+                continue;
+            }
+        };
+
+        if result.text.is_empty() {
+            continue;
+        }
+
+        println!("[STREAMING] Transcribed: '{}'", result.text);
+
+        // Émettre le chunk vers le frontend
+        #[derive(serde::Serialize, Clone)]
+        struct StreamingChunk {
+            text: String,
+            is_final: bool,
+            duration_seconds: f32,
+        }
+        let chunk = StreamingChunk {
+            text: result.text.clone(),
+            is_final: false,
+            duration_seconds: duration,
+        };
+        let _ = app.emit("transcription-chunk", chunk);
+
+        // Taper le nouveau texte (incrémental)
+        let current_text = result.text.trim();
+        if current_text.len() > last_text_len {
+            // Taper seulement les nouveaux caractères
+            let new_text = &current_text[last_text_len..];
+            if !new_text.trim().is_empty() {
+                println!("[STREAMING] Typing new text: '{}'", new_text);
+                type_text_incremental(new_text);
+            }
+            last_text_len = current_text.len();
+
+            // Sauvegarder le texte actuel pour la fin
+            if let Ok(mut streaming_text) = STREAMING_TEXT.lock() {
+                *streaming_text = current_text.to_string();
+            }
+        }
+    }
+
+    println!("[STREAMING] Streaming transcription ended");
+}
+
+/// Tape du texte caractère par caractère (pour le streaming)
+fn type_text_incremental(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        // Échapper le texte pour AppleScript
+        let escaped = text
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n");
+
+        let script = format!(
+            r#"tell application "System Events" to keystroke "{}""#,
+            escaped
+        );
+
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .output();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Sur Windows, utiliser SendInput pour chaque caractère
+        // Pour simplifier, on utilise la même approche que paste_text
+        // mais avec un délai entre les caractères
+        use std::io::Write;
+        match Command::new("cmd")
+            .args(["/C", &format!("echo|set /p=\"{}\"| clip", text)])
+            .output()
+        {
+            Ok(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Simuler Ctrl+V pour coller
+                use windows::Win32::UI::Input::KeyboardAndMouse::{
+                    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+                    KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
+                };
+                let inputs: [INPUT; 4] = [
+                    INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_CONTROL, wScan: 0, dwFlags: KEYBD_EVENT_FLAGS(0), time: 0, dwExtraInfo: 0 } } },
+                    INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_V, wScan: 0, dwFlags: KEYBD_EVENT_FLAGS(0), time: 0, dwExtraInfo: 0 } } },
+                    INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_V, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 } } },
+                    INPUT { r#type: INPUT_KEYBOARD, Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_CONTROL, wScan: 0, dwFlags: KEYEVENTF_KEYUP, time: 0, dwExtraInfo: 0 } } },
+                ];
+                unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+            }
+            Err(_) => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+        if wayland {
+            let _ = Command::new("wtype").arg(text).output();
+        } else {
+            let _ = Command::new("xdotool").args(["type", "--", text]).output();
+        }
+    }
+}
+
 /// Taux d'échantillonnage requis par le modèle Parakeet
 const TARGET_SAMPLE_RATE: u32 = 16000;
 
 /// Arrête l'enregistrement et colle le texte transcrit
 fn stop_ptt_and_paste(app: &tauri::AppHandle) {
     println!("[PTT] stop_ptt_and_paste() called");
+
+    // Récupérer le texte déjà tapé en streaming
+    let streaming_text = STREAMING_TEXT.lock().ok().map(|t| t.clone()).unwrap_or_default();
+    let had_streaming = !streaming_text.is_empty();
+    println!("[PTT] Streaming text so far: '{}' (had_streaming={})", streaming_text, had_streaming);
 
     // Envoyer la commande d'arrêt
     if let Ok(guard) = PTT_AUDIO_SENDER.lock() {
@@ -665,13 +875,17 @@ fn stop_ptt_and_paste(app: &tauri::AppHandle) {
     }
 
     // Attendre les données audio
-    let ptt_result = if let Ok(guard) = PTT_AUDIO_RECEIVER.lock() {
+    let (audio_data, sample_rate) = if let Ok(guard) = PTT_AUDIO_RECEIVER.lock() {
         if let Some(ref receiver) = *guard {
-            match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(result) => result,
-                Err(e) => {
-                    log::error!("Failed to receive audio data: {}", e);
-                    return;
+            // Peut recevoir des snapshots résiduels, on attend le AudioComplete
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(PttResult::AudioComplete { audio, sample_rate }) => break (audio, sample_rate),
+                    Ok(PttResult::AudioSnapshot { .. }) => continue, // Ignorer les snapshots
+                    Err(e) => {
+                        log::error!("Failed to receive audio data: {}", e);
+                        return;
+                    }
                 }
             }
         } else {
@@ -682,9 +896,6 @@ fn stop_ptt_and_paste(app: &tauri::AppHandle) {
         log::error!("Failed to lock PTT audio receiver");
         return;
     };
-
-    let audio_data = ptt_result.audio;
-    let sample_rate = ptt_result.sample_rate;
 
     if audio_data.is_empty() {
         log::warn!("Audio buffer is empty");
@@ -755,8 +966,25 @@ fn stop_ptt_and_paste(app: &tauri::AppHandle) {
     // Sauvegarder dans l'historique
     let _ = storage::history::add_transcription(result.clone());
 
-    // Coller le texte
-    paste_text(&result.text);
+    // Taper le texte restant (non tapé en streaming)
+    let final_text = result.text.trim();
+    if had_streaming && final_text.len() > streaming_text.len() {
+        // Taper seulement la partie restante
+        let remaining = &final_text[streaming_text.len()..];
+        if !remaining.trim().is_empty() {
+            println!("[PTT] Typing remaining text: '{}'", remaining);
+            type_text_incremental(remaining.trim());
+        }
+    } else if !had_streaming {
+        // Pas de streaming, coller tout le texte
+        paste_text(&result.text);
+    }
+    // Si had_streaming et le texte final est <= streaming_text, rien à faire
+
+    // Nettoyer le texte streaming
+    if let Ok(mut text) = STREAMING_TEXT.lock() {
+        text.clear();
+    }
 }
 
 /// Resampling linéaire simple de l'audio

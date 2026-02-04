@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod file_transcription;
 pub mod llm;
 pub mod models;
 pub mod settings;

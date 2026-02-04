@@ -337,6 +337,8 @@ pub fn run() {
             commands::set_floating_window_size,
             commands::get_floating_window_position,
             commands::set_floating_window_position,
+            commands::file_transcription::transcribe_files,
+            commands::file_transcription::get_supported_audio_formats,
         ])
         .setup(|app| {
             // Initialiser l'état avec le moteur Whisper

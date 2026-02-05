@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { DictationPanel } from './components/DictationPanel';
 import { TranscriptionHistory } from './components/TranscriptionHistory';
 import { SettingsPanel } from './components/SettingsPanel';
@@ -7,9 +8,11 @@ import { FileTranscription } from './components/FileTranscription';
 import { useSettingsStore } from './stores/settingsStore';
 import { useTranscriptionStore } from './stores/transcriptionStore';
 import { useHotkeys } from './hooks/useHotkeys';
+import { GroqQuota } from './types';
 import logoSvg from './assets/logo.svg';
 
 type Tab = 'dictation' | 'history' | 'files';
+type AppStatus = 'idle' | 'recording' | 'translating' | 'voice-action';
 
 // Formatte un raccourci clavier pour l'affichage
 function formatHotkey(hotkey: string): string {
@@ -26,15 +29,73 @@ function formatHotkey(hotkey: string): string {
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>('dictation');
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [groqQuota, setGroqQuota] = useState<GroqQuota | null>(null);
+  const [appStatus, setAppStatus] = useState<AppStatus>('idle');
   const { settings, loadSettings } = useSettingsStore();
   const { initialize } = useTranscriptionStore();
 
   useHotkeys();
 
+  // Écouter les événements de statut du backend
+  useEffect(() => {
+    const unlisteners: Array<() => void> = [];
+
+    // Recording status (PTT)
+    listen<string>('recording-status', (event) => {
+      if (event.payload === 'recording') {
+        setAppStatus('recording');
+      } else if (event.payload === 'idle') {
+        setAppStatus('idle');
+      }
+    }).then(unlisten => unlisteners.push(unlisten));
+
+    // Translation status
+    listen<string>('translation-status', (event) => {
+      if (event.payload === 'translating') {
+        setAppStatus('translating');
+      } else if (event.payload === 'idle') {
+        setAppStatus('idle');
+      }
+    }).then(unlisten => unlisteners.push(unlisten));
+
+    // Voice action status
+    listen<string>('voice-action-status', (event) => {
+      if (event.payload === 'recording' || event.payload === 'processing') {
+        setAppStatus('voice-action');
+      } else if (event.payload === 'idle') {
+        setAppStatus('idle');
+      }
+    }).then(unlisten => unlisteners.push(unlisten));
+
+    return () => {
+      unlisteners.forEach(unlisten => unlisten());
+    };
+  }, []);
+
+  const fetchGroqQuota = useCallback(async () => {
+    if (settings?.llm_enabled) {
+      try {
+        const quota = await invoke<GroqQuota | null>('get_groq_quota');
+        setGroqQuota(quota);
+      } catch (e) {
+        console.error('Failed to fetch Groq quota:', e);
+      }
+    }
+  }, [settings?.llm_enabled]);
+
   useEffect(() => {
     loadSettings();
     initialize();
   }, [loadSettings, initialize]);
+
+  // Récupérer le quota Groq périodiquement si LLM est actif
+  useEffect(() => {
+    if (settings?.llm_enabled) {
+      fetchGroqQuota();
+      const interval = setInterval(fetchGroqQuota, 30000); // Toutes les 30 secondes
+      return () => clearInterval(interval);
+    }
+  }, [settings?.llm_enabled, fetchGroqQuota]);
 
   useEffect(() => {
     if (settings?.floating_window_enabled) {
@@ -73,10 +134,37 @@ function App() {
               </div>
 
               {/* Status indicator */}
-              <div className="flex items-center gap-2.5 px-4 py-2 bg-[rgba(255,255,255,0.04)] border border-[var(--glass-border)] rounded-xl">
-                <div className="led-frost active" />
-                <span className="text-[0.7rem] text-[var(--text-secondary)] font-medium">
-                  Systeme actif
+              <div className={`flex items-center gap-2.5 px-4 py-2 border rounded-xl transition-all ${
+                appStatus === 'idle'
+                  ? 'bg-[rgba(255,255,255,0.04)] border-[var(--glass-border)]'
+                  : appStatus === 'recording'
+                  ? 'bg-[rgba(255,59,48,0.15)] border-[rgba(255,59,48,0.5)]'
+                  : appStatus === 'translating'
+                  ? 'bg-[rgba(0,122,255,0.15)] border-[rgba(0,122,255,0.5)]'
+                  : 'bg-[rgba(255,179,0,0.15)] border-[rgba(255,179,0,0.5)]'
+              }`}>
+                <div className={`w-2.5 h-2.5 rounded-full ${
+                  appStatus === 'idle'
+                    ? 'bg-[var(--accent-success)]'
+                    : appStatus === 'recording'
+                    ? 'bg-[#FF3B30] animate-pulse'
+                    : appStatus === 'translating'
+                    ? 'bg-[#007AFF] animate-pulse'
+                    : 'bg-[#FFB300] animate-pulse'
+                }`} />
+                <span className={`text-[0.7rem] font-medium ${
+                  appStatus === 'idle'
+                    ? 'text-[var(--text-secondary)]'
+                    : appStatus === 'recording'
+                    ? 'text-[#FF3B30]'
+                    : appStatus === 'translating'
+                    ? 'text-[#007AFF]'
+                    : 'text-[#FFB300]'
+                }`}>
+                  {appStatus === 'idle' && 'Systeme actif'}
+                  {appStatus === 'recording' && 'Transcription...'}
+                  {appStatus === 'translating' && 'Traduction...'}
+                  {appStatus === 'voice-action' && 'Voice Action...'}
                 </span>
               </div>
             </div>
@@ -146,20 +234,74 @@ function App() {
 
         {/* Footer status bar */}
         <footer className="flex-shrink-0 px-6 pb-4">
-          <div className="glass-panel px-5 py-3 flex justify-between items-center">
+          <div className="glass-panel px-5 py-3 flex justify-between items-center overflow-visible">
             <div className="flex items-center gap-4">
               <span className="tag-frost">
-                {settings?.engine_type === 'whisper' && 'Whisper.cpp'}
-                {settings?.engine_type === 'vosk' && 'Vosk'}
-                {settings?.engine_type === 'parakeet' && 'Parakeet'}
+                {settings?.engine_type === 'whisper' && `Whisper ${settings.whisper_model.charAt(0).toUpperCase() + settings.whisper_model.slice(1)}`}
+                {settings?.engine_type === 'vosk' && `Vosk ${settings.vosk_language?.toUpperCase() || ''}`}
+                {settings?.engine_type === 'parakeet' && 'Parakeet TDT'}
               </span>
               {settings?.dictation_mode && settings.dictation_mode !== 'general' && (
                 <span className="tag-frost accent">
                   {settings.dictation_mode === 'email' ? 'Email' : settings.dictation_mode === 'code' ? 'Code' : 'Notes'}
                 </span>
               )}
-              {settings?.llm_enabled && (
-                <span className="tag-frost success">LLM</span>
+              {settings?.llm_enabled && settings?.llm_provider === 'groq' && (
+                <div className="relative group">
+                  <span className="tag-frost success flex items-center gap-2 cursor-help">
+                    LLM (Groq)
+                    {groqQuota?.remaining_requests != null && groqQuota?.limit_requests != null && (
+                      <span className="text-[0.6rem] opacity-80">
+                        {groqQuota.remaining_requests}/{groqQuota.limit_requests}
+                      </span>
+                    )}
+                  </span>
+                  {/* Tooltip détaillé des quotas */}
+                  {groqQuota && (
+                    <div className="absolute bottom-full left-0 mb-2 p-3 min-w-[220px] bg-[var(--glass-bg)] backdrop-blur-xl border border-[var(--glass-border)] rounded-xl shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50">
+                      <div className="text-[0.7rem] font-medium text-[var(--text-primary)] mb-2">Quotas Groq API</div>
+                      <div className="space-y-2 text-[0.65rem]">
+                        {/* Requêtes par jour */}
+                        <div>
+                          <div className="flex justify-between text-[var(--text-muted)] mb-1">
+                            <span>Requetes/jour</span>
+                            <span>{groqQuota.remaining_requests ?? '?'}/{groqQuota.limit_requests ?? '?'}</span>
+                          </div>
+                          <div className="h-1.5 bg-[rgba(255,255,255,0.1)] rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-[var(--accent-success)] to-[var(--accent-primary)]"
+                              style={{ width: `${groqQuota.limit_requests ? ((groqQuota.remaining_requests ?? 0) / groqQuota.limit_requests * 100) : 0}%` }}
+                            />
+                          </div>
+                          {groqQuota.reset_requests && (
+                            <div className="text-[var(--text-muted)] mt-0.5">Reset: {groqQuota.reset_requests}</div>
+                          )}
+                        </div>
+                        {/* Tokens par minute */}
+                        <div>
+                          <div className="flex justify-between text-[var(--text-muted)] mb-1">
+                            <span>Tokens/min</span>
+                            <span>{groqQuota.remaining_tokens ?? '?'}/{groqQuota.limit_tokens ?? '?'}</span>
+                          </div>
+                          <div className="h-1.5 bg-[rgba(255,255,255,0.1)] rounded-full overflow-hidden">
+                            <div
+                              className="h-full bg-gradient-to-r from-[var(--accent-primary)] to-[var(--accent-secondary)]"
+                              style={{ width: `${groqQuota.limit_tokens ? ((groqQuota.remaining_tokens ?? 0) / groqQuota.limit_tokens * 100) : 0}%` }}
+                            />
+                          </div>
+                          {groqQuota.reset_tokens && (
+                            <div className="text-[var(--text-muted)] mt-0.5">Reset: {groqQuota.reset_tokens}</div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+              {settings?.llm_enabled && settings?.llm_provider === 'local' && (
+                <span className="tag-frost success flex items-center gap-2">
+                  LLM (Local)
+                </span>
               )}
             </div>
             <div className="flex items-center gap-3">

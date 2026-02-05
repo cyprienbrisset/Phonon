@@ -1,10 +1,64 @@
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const GROQ_API_ENDPOINT: &str = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL: &str = "llama-3.1-70b-versatile";
-const TIMEOUT_SECONDS: u64 = 5;
+const GROQ_MODEL: &str = "llama-3.3-70b-versatile";
+const TIMEOUT_SECONDS: u64 = 30;
+
+/// Informations de quota Groq (mises à jour après chaque requête)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GroqQuota {
+    pub limit_requests: Option<u32>,
+    pub remaining_requests: Option<u32>,
+    pub limit_tokens: Option<u32>,
+    pub remaining_tokens: Option<u32>,
+    pub reset_requests: Option<String>,
+    pub reset_tokens: Option<String>,
+}
+
+/// Stockage global du dernier quota connu
+static LAST_QUOTA: Mutex<Option<GroqQuota>> = Mutex::new(None);
+
+/// Récupère le dernier quota connu
+pub fn get_last_quota() -> Option<GroqQuota> {
+    LAST_QUOTA.lock().ok().and_then(|guard| guard.clone())
+}
+
+/// Met à jour le quota depuis les headers de réponse
+fn update_quota_from_headers(headers: &reqwest::header::HeaderMap) {
+    let quota = GroqQuota {
+        limit_requests: headers
+            .get("x-ratelimit-limit-requests")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        remaining_requests: headers
+            .get("x-ratelimit-remaining-requests")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        limit_tokens: headers
+            .get("x-ratelimit-limit-tokens")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        remaining_tokens: headers
+            .get("x-ratelimit-remaining-tokens")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok()),
+        reset_requests: headers
+            .get("x-ratelimit-reset-requests")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+        reset_tokens: headers
+            .get("x-ratelimit-reset-tokens")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+    };
+
+    if let Ok(mut guard) = LAST_QUOTA.lock() {
+        *guard = Some(quota);
+    }
+}
 
 #[derive(Debug)]
 pub enum GroqError {
@@ -100,6 +154,9 @@ pub async fn send_completion(
         })?;
 
     let status = response.status();
+
+    // Capturer les informations de quota depuis les headers
+    update_quota_from_headers(response.headers());
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(GroqError::InvalidApiKey);

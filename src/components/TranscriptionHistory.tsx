@@ -1,12 +1,59 @@
-import { useEffect } from 'react';
+import { useEffect, useState, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useTranscriptionStore } from '../stores/transcriptionStore';
+import { useSettingsStore } from '../stores/settingsStore';
+import { LlmProvider } from '../types';
+
+interface SummaryState {
+  [key: number]: {
+    loading: boolean;
+    text: string | null;
+    error: string | null;
+  };
+}
 
 export function TranscriptionHistory() {
   const { history, loadHistory, clearHistory } = useTranscriptionStore();
+  const settings = useSettingsStore(state => state.settings);
+  const [summaries, setSummaries] = useState<SummaryState>({});
+  const [localLlmAvailable, setLocalLlmAvailable] = useState(false);
 
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
+
+  // Vérifier si le modèle LLM local est disponible
+  useEffect(() => {
+    if (settings?.local_llm_model) {
+      invoke<boolean>('is_llm_model_available', { modelSize: settings.local_llm_model })
+        .then(setLocalLlmAvailable)
+        .catch(() => setLocalLlmAvailable(false));
+    }
+  }, [settings?.local_llm_model]);
+
+  const handleSummarize = useCallback(async (index: number, text: string, provider?: LlmProvider) => {
+    setSummaries(prev => ({
+      ...prev,
+      [index]: { loading: true, text: null, error: null }
+    }));
+
+    try {
+      const summary = await invoke<string>('summarize_text_smart', { text, provider });
+      setSummaries(prev => ({
+        ...prev,
+        [index]: { loading: false, text: summary, error: null }
+      }));
+    } catch (e) {
+      setSummaries(prev => ({
+        ...prev,
+        [index]: { loading: false, text: null, error: String(e) }
+      }));
+    }
+  }, []);
+
+  const handleCopySummary = useCallback((text: string) => {
+    navigator.clipboard.writeText(text);
+  }, []);
 
   const formatDate = (timestamp: number) => {
     return new Date(timestamp * 1000).toLocaleString('fr-FR', {
@@ -76,16 +123,109 @@ export function TranscriptionHistory() {
                   </span>
                 )}
               </div>
-              <span className="text-[0.75rem] text-[var(--text-muted)] tabular-nums">
-                {item.duration_seconds.toFixed(1)}s
-              </span>
+              <div className="flex items-center gap-2">
+                {/* Bouton résumé */}
+                {summaries[index]?.loading ? (
+                  <button
+                    disabled
+                    className="btn-glass text-[0.7rem] py-1 px-2 opacity-50"
+                  >
+                    <div className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                  </button>
+                ) : localLlmAvailable && settings?.groq_api_key ? (
+                  <div className="relative group">
+                    <button className="btn-glass text-[0.7rem] py-1 px-2 flex items-center gap-1">
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <line x1="16" y1="13" x2="8" y2="13" />
+                        <line x1="16" y1="17" x2="8" y2="17" />
+                      </svg>
+                      <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <polyline points="6 9 12 15 18 9" />
+                      </svg>
+                    </button>
+                    <div className="absolute top-full right-0 mt-1 py-1 min-w-[120px] bg-[var(--glass-bg)] backdrop-blur-xl border border-[var(--glass-border)] rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-10">
+                      <button
+                        onClick={() => handleSummarize(index, item.text, 'local')}
+                        className="w-full px-3 py-1.5 text-left text-[0.7rem] text-[var(--text-secondary)] hover:bg-[rgba(255,255,255,0.08)] flex items-center gap-2"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                        Local
+                      </button>
+                      <button
+                        onClick={() => handleSummarize(index, item.text, 'groq')}
+                        className="w-full px-3 py-1.5 text-left text-[0.7rem] text-[var(--text-secondary)] hover:bg-[rgba(255,255,255,0.08)] flex items-center gap-2"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-blue-500" />
+                        Cloud
+                      </button>
+                    </div>
+                  </div>
+                ) : (localLlmAvailable || settings?.groq_api_key) ? (
+                  <button
+                    onClick={() => handleSummarize(index, item.text)}
+                    className="btn-glass text-[0.7rem] py-1 px-2"
+                    title={localLlmAvailable ? 'Resume (local)' : 'Resume (cloud)'}
+                  >
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <line x1="16" y1="13" x2="8" y2="13" />
+                      <line x1="16" y1="17" x2="8" y2="17" />
+                    </svg>
+                  </button>
+                ) : null}
+                <span className="text-[0.75rem] text-[var(--text-muted)] tabular-nums">
+                  {item.duration_seconds.toFixed(1)}s
+                </span>
+                {item.processing_time_ms > 0 && (
+                  <span className="text-[0.65rem] text-[var(--text-muted)] opacity-70 tabular-nums">
+                    ⚡ {item.processing_time_ms}ms
+                  </span>
+                )}
+              </div>
             </div>
 
             {/* Item content */}
-            <div className="card-content">
+            <div className="card-content space-y-3">
               <p className="text-[var(--text-primary)] text-[0.9375rem] leading-relaxed line-clamp-3">
                 {item.text}
               </p>
+
+              {/* Erreur de résumé */}
+              {summaries[index]?.error && (
+                <div className="p-2 rounded-lg bg-[var(--accent-danger-soft)] border border-[var(--accent-danger)]">
+                  <p className="text-[0.75rem] text-[var(--accent-danger)]">{summaries[index].error}</p>
+                </div>
+              )}
+
+              {/* Affichage du résumé */}
+              {summaries[index]?.text && (
+                <div className="p-3 rounded-xl bg-[rgba(139,92,246,0.08)] border border-[var(--accent-primary-soft)]">
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--accent-primary)" strokeWidth="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <line x1="16" y1="13" x2="8" y2="13" />
+                        <line x1="16" y1="17" x2="8" y2="17" />
+                      </svg>
+                      <span className="text-[0.7rem] font-medium text-[var(--accent-primary)]">Resume</span>
+                    </div>
+                    <button
+                      onClick={() => handleCopySummary(summaries[index].text!)}
+                      className="text-[var(--text-muted)] hover:text-[var(--accent-primary)] transition-colors"
+                      title="Copier le resume"
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                      </svg>
+                    </button>
+                  </div>
+                  <p className="text-[var(--text-primary)] text-[0.8rem] leading-relaxed">
+                    {summaries[index].text}
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         ))}

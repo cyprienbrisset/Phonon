@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    wakascribe_temp_lib::run()
+    scribe_lib::run()
 }

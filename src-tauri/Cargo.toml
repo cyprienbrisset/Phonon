@@ -1,17 +1,14 @@
 [package]
-name = "wakascribe-temp"
-version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+name = "scribe"
+version = "1.0.0"
+description = "Scribe - Dictée vocale intelligente"
+authors = ["Cyprien BRISSET"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "wakascribe_temp_lib"
+name = "scribe_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -59,6 +56,9 @@ rubato = "0.15"
 
 # Zip extraction for model downloads
 zip = "0.6"
+
+# LLM local inference via llama.cpp
+llama-cpp-2 = "0.1"
 
 
 [features]

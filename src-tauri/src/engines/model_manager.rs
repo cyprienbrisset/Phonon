@@ -1,4 +1,4 @@
-use crate::types::{ModelSize, ParakeetModelSize, VoskLanguage};
+use crate::types::{LocalLlmModel, ModelSize, ParakeetModelSize, VoskLanguage};
 use futures_util::StreamExt;
 use std::path::PathBuf;
 use tokio::fs;
@@ -340,6 +340,104 @@ impl ModelManager {
             fs::remove_dir_all(&model_dir)
                 .await
                 .map_err(|e| format!("Failed to delete model: {}", e))?;
+        }
+        Ok(())
+    }
+
+    // === LLM MODELS (Mistral) ===
+
+    /// Get path to a LLM model if installed
+    pub fn get_llm_model_path(&self, model_size: LocalLlmModel) -> Option<PathBuf> {
+        let llm_dir = self.models_dir.join("llm");
+        let model_path = llm_dir.join(model_size.file_name());
+        if model_path.exists() {
+            Some(model_path)
+        } else {
+            None
+        }
+    }
+
+    /// Check if a LLM model is available
+    pub fn is_llm_model_available(&self, model_size: LocalLlmModel) -> bool {
+        self.get_llm_model_path(model_size).is_some()
+    }
+
+    /// List available LLM models
+    pub fn available_llm_models(&self) -> Vec<LocalLlmModel> {
+        [LocalLlmModel::SmolLM2_360M, LocalLlmModel::Phi3Mini, LocalLlmModel::Qwen2_5_3B]
+            .into_iter()
+            .filter(|&size| self.is_llm_model_available(size))
+            .collect()
+    }
+
+    /// Download a LLM model from HuggingFace
+    pub async fn download_llm_model<F>(
+        &self,
+        model_size: LocalLlmModel,
+        progress_callback: F,
+    ) -> Result<PathBuf, String>
+    where
+        F: Fn(u64, u64) + Send + 'static,
+    {
+        let llm_dir = self.models_dir.join("llm");
+        fs::create_dir_all(&llm_dir)
+            .await
+            .map_err(|e| format!("Failed to create llm directory: {}", e))?;
+
+        let dest_path = llm_dir.join(model_size.file_name());
+        let url = model_size.download_url();
+
+        log::info!("Downloading LLM model {} from {}", model_size.file_name(), url);
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to start download: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("Download failed with status: {}", response.status()));
+        }
+
+        let total_size = response.content_length().unwrap_or(model_size.size_bytes());
+        let mut downloaded: u64 = 0;
+
+        let mut file = fs::File::create(&dest_path)
+            .await
+            .map_err(|e| format!("Failed to create file: {}", e))?;
+
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Write error: {}", e))?;
+            downloaded += chunk.len() as u64;
+            progress_callback(downloaded, total_size);
+        }
+
+        file.flush()
+            .await
+            .map_err(|e| format!("Flush error: {}", e))?;
+
+        log::info!("LLM model {} downloaded successfully", model_size.file_name());
+        Ok(dest_path)
+    }
+
+    /// Delete a LLM model
+    pub async fn delete_llm_model(&self, model_size: LocalLlmModel) -> Result<(), String> {
+        let llm_dir = self.models_dir.join("llm");
+        let path = llm_dir.join(model_size.file_name());
+        if path.exists() {
+            fs::remove_file(&path)
+                .await
+                .map_err(|e| format!("Failed to delete LLM model: {}", e))?;
         }
         Ok(())
     }

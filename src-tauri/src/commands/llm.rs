@@ -1,42 +1,58 @@
+use std::sync::Arc;
 use keyring::Entry;
+use tauri::{Emitter, State};
+use tokio::sync::RwLock;
 
-use crate::llm::groq_client;
+use crate::engines::ModelManager;
+use crate::llm::{groq_client, LocalLlmEngine};
+use crate::storage::config;
+use crate::types::{LlmProvider, LocalLlmModel};
 
 const SERVICE_NAME: &str = "wakascribe";
 const ACCOUNT_NAME: &str = "groq_api_key";
 
-/// Stocke la clé API Groq dans le keyring sécurisé du système
+/// Stocke la clé API Groq dans les settings de l'application (et keyring en backup)
 #[tauri::command]
 pub fn set_groq_api_key(key: String) -> Result<(), String> {
-    let entry = Entry::new(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
+    // Stocker dans les settings (méthode principale)
+    let mut settings = config::load_settings();
+    settings.groq_api_key = Some(key.clone());
+    config::save_settings(&settings)?;
 
-    entry
-        .set_password(&key)
-        .map_err(|e| format!("Failed to store API key: {}", e))
+    // Essayer aussi le keyring en backup (mais ne pas échouer si ça marche pas)
+    if let Ok(entry) = Entry::new(SERVICE_NAME, ACCOUNT_NAME) {
+        let _ = entry.set_password(&key);
+    }
+
+    Ok(())
 }
 
-/// Récupère la clé API Groq depuis le keyring (pour validation interne)
+/// Récupère la clé API Groq (settings en priorité, puis keyring)
 #[tauri::command]
 pub fn get_groq_api_key() -> Option<String> {
     get_groq_api_key_internal()
 }
 
-/// Récupère la clé API Groq depuis le keyring (usage interne sans attribut tauri::command)
+/// Récupère la clé API Groq (usage interne sans attribut tauri::command)
+/// Vérifie d'abord dans les settings, puis dans le keyring
 pub fn get_groq_api_key_internal() -> Option<String> {
+    // 1. Vérifier dans les settings
+    let settings = config::load_settings();
+    if let Some(ref key) = settings.groq_api_key {
+        if !key.is_empty() {
+            return Some(key.clone());
+        }
+    }
+
+    // 2. Fallback sur le keyring
     let entry = Entry::new(SERVICE_NAME, ACCOUNT_NAME).ok()?;
     entry.get_password().ok()
 }
 
-/// Vérifie si une clé API Groq existe dans le keyring
+/// Vérifie si une clé API Groq existe
 #[tauri::command]
 pub fn has_groq_api_key() -> bool {
-    let entry = match Entry::new(SERVICE_NAME, ACCOUNT_NAME) {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-
-    entry.get_password().is_ok()
+    get_groq_api_key_internal().is_some()
 }
 
 /// Valide une clé API Groq en effectuant une requête de test à l'API
@@ -66,15 +82,53 @@ pub async fn validate_groq_api_key(key: String) -> bool {
     }
 }
 
-/// Supprime la clé API Groq du keyring
+/// Supprime la clé API Groq (des settings et du keyring)
 #[tauri::command]
 pub fn delete_groq_api_key() -> Result<(), String> {
-    let entry = Entry::new(SERVICE_NAME, ACCOUNT_NAME)
-        .map_err(|e| format!("Failed to access keyring entry: {}", e))?;
+    // Supprimer des settings
+    let mut settings = config::load_settings();
+    settings.groq_api_key = None;
+    config::save_settings(&settings)?;
 
-    entry
-        .delete_credential()
-        .map_err(|e| format!("Failed to delete API key: {}", e))
+    // Essayer de supprimer du keyring aussi
+    if let Ok(entry) = Entry::new(SERVICE_NAME, ACCOUNT_NAME) {
+        let _ = entry.delete_credential();
+    }
+
+    Ok(())
+}
+
+/// Récupère les informations de quota Groq
+#[tauri::command]
+pub fn get_groq_quota() -> Option<groq_client::GroqQuota> {
+    groq_client::get_last_quota()
+}
+
+/// Résume un texte transcrit via Groq
+#[tauri::command]
+pub async fn summarize_text(text: String) -> Result<String, String> {
+    let api_key = get_groq_api_key_internal()
+        .ok_or_else(|| "Clé API Groq non configurée. Configurez-la dans les paramètres.".to_string())?;
+
+    let system_prompt = r#"Tu es un assistant spécialisé dans le résumé de transcriptions audio (réunions, présentations, interviews).
+
+Génère un résumé CONCIS en 2-4 phrases maximum. Pas de puces, pas de liste, pas de métadonnées. Juste l'essentiel en prose fluide.
+
+Exemple de format attendu :
+"Cyprien présente WakaStart, une plateforme SaaS de déploiement d'applications. L'équipe propose un accompagnement complet (consultants, développeurs, RSSI) pour obtenir les certifications nécessaires aux levées de fonds."
+
+Retourne UNIQUEMENT le résumé, rien d'autre."#;
+
+    match groq_client::send_completion(&api_key, system_prompt, &text).await {
+        Ok(summary) => {
+            log::info!("Summarization successful: {} chars -> {} chars", text.len(), summary.len());
+            Ok(summary.trim().to_string())
+        }
+        Err(e) => {
+            log::error!("Summarization failed: {}", e);
+            Err(format!("Échec du résumé: {}", e))
+        }
+    }
 }
 
 /// Traduit un texte vers une langue cible via Groq
@@ -114,6 +168,139 @@ pub async fn translate_text(text: String, target_language: String) -> Result<Str
         Err(e) => {
             log::error!("Translation failed: {}", e);
             Err(format!("Translation failed: {}", e))
+        }
+    }
+}
+
+// === LLM LOCAL (MISTRAL) ===
+
+/// Vérifie si un modèle LLM local est disponible
+#[tauri::command]
+pub fn is_llm_model_available(
+    model_manager: State<'_, Arc<ModelManager>>,
+    model_size: LocalLlmModel,
+) -> bool {
+    model_manager.is_llm_model_available(model_size)
+}
+
+/// Liste les modèles LLM disponibles
+#[tauri::command]
+pub fn get_available_llm_models(
+    model_manager: State<'_, Arc<ModelManager>>,
+) -> Vec<LocalLlmModel> {
+    model_manager.available_llm_models()
+}
+
+/// Télécharge un modèle LLM
+#[tauri::command]
+pub async fn download_llm_model(
+    app: tauri::AppHandle,
+    model_manager: State<'_, Arc<ModelManager>>,
+    model_size: LocalLlmModel,
+) -> Result<String, String> {
+    log::info!("download_llm_model called with model_size: {:?}", model_size);
+    println!("[LLM] download_llm_model called with model_size: {:?}", model_size);
+
+    let manager = model_manager.inner().clone();
+    let app_clone = app.clone();
+
+    let result = manager
+        .download_llm_model(model_size, move |downloaded, total| {
+            let progress = (downloaded as f64 / total as f64 * 100.0) as u32;
+            if downloaded % (10 * 1024 * 1024) < 1024 * 1024 {
+                println!("[LLM] Download progress: {}% ({}/{})", progress, downloaded, total);
+            }
+            let _ = app_clone.emit("llm-download-progress", serde_json::json!({
+                "model": model_size,
+                "downloaded": downloaded,
+                "total": total,
+                "progress": progress
+            }));
+        })
+        .await;
+
+    match &result {
+        Ok(path) => {
+            log::info!("LLM model downloaded successfully to: {:?}", path);
+            println!("[LLM] Model downloaded successfully to: {:?}", path);
+        }
+        Err(e) => {
+            log::error!("LLM model download failed: {}", e);
+            println!("[LLM] Download failed: {}", e);
+        }
+    }
+
+    result.map(|path| path.to_string_lossy().to_string())
+}
+
+/// Supprime un modèle LLM
+#[tauri::command]
+pub async fn delete_llm_model(
+    model_manager: State<'_, Arc<ModelManager>>,
+    model_size: LocalLlmModel,
+) -> Result<(), String> {
+    model_manager.delete_llm_model(model_size).await
+}
+
+/// Résume un texte avec le modèle local Mistral
+#[tauri::command]
+pub async fn summarize_text_local(
+    model_manager: State<'_, Arc<ModelManager>>,
+    llm_engine: State<'_, Arc<RwLock<Option<LocalLlmEngine>>>>,
+    text: String,
+) -> Result<String, String> {
+    let settings = config::load_settings();
+
+    // Vérifier que le modèle est disponible
+    let model_path = model_manager
+        .get_llm_model_path(settings.local_llm_model)
+        .ok_or_else(|| format!(
+            "Modèle LLM {} non installé. Téléchargez-le dans les paramètres.",
+            settings.local_llm_model.display_name()
+        ))?;
+
+    // Charger le moteur si nécessaire
+    {
+        let engine_read = llm_engine.read().await;
+        if engine_read.is_none() {
+            drop(engine_read);
+            let mut engine_write = llm_engine.write().await;
+            if engine_write.is_none() {
+                log::info!("Initializing Local LLM engine...");
+                let engine = LocalLlmEngine::new(&model_path, settings.local_llm_model)?;
+                *engine_write = Some(engine);
+            }
+        }
+    }
+
+    // Effectuer le résumé
+    let engine_read = llm_engine.read().await;
+    let engine = engine_read.as_ref().ok_or("LLM engine not initialized")?;
+
+    log::info!("Summarizing {} chars with local LLM", text.len());
+    let summary = engine.summarize(&text)?;
+    log::info!("Local summarization complete: {} chars", summary.len());
+
+    Ok(summary)
+}
+
+/// Résume un texte avec le provider configuré (auto-sélection local/cloud)
+#[tauri::command]
+pub async fn summarize_text_smart(
+    model_manager: State<'_, Arc<ModelManager>>,
+    llm_engine: State<'_, Arc<RwLock<Option<LocalLlmEngine>>>>,
+    text: String,
+    provider: Option<LlmProvider>,
+) -> Result<String, String> {
+    let settings = config::load_settings();
+    let use_provider = provider.unwrap_or(settings.llm_provider);
+
+    match use_provider {
+        LlmProvider::Local => {
+            summarize_text_local(model_manager, llm_engine, text).await
+        }
+        LlmProvider::Groq => {
+            summarize_text(text).await
         }
     }
 }

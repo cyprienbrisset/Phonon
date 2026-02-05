@@ -15,6 +15,91 @@ impl Default for LlmMode {
     }
 }
 
+/// Provider pour les fonctionnalités LLM (résumé, post-traitement)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    #[default]
+    Groq,
+    Local,
+}
+
+/// Taille des modèles LLM locaux
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum LocalLlmModel {
+    #[serde(rename = "smollm2_360m")]
+    SmolLM2_360M,    // ~386 MB - Ultra rapide, résumés basiques
+    #[default]
+    #[serde(rename = "phi3_mini")]
+    Phi3Mini,        // ~2.2 GB - Excellent rapport qualité/taille (recommandé)
+    #[serde(rename = "qwen2_5_3b")]
+    Qwen2_5_3B,      // ~2.0 GB - Très bonne qualité
+}
+
+impl LocalLlmModel {
+    pub fn file_name(&self) -> &'static str {
+        match self {
+            LocalLlmModel::SmolLM2_360M => "SmolLM2-360M-Instruct-Q8_0.gguf",
+            LocalLlmModel::Phi3Mini => "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+            LocalLlmModel::Qwen2_5_3B => "qwen2.5-3b-instruct-q4_k_m.gguf",
+        }
+    }
+
+    pub fn download_url(&self) -> &'static str {
+        match self {
+            LocalLlmModel::SmolLM2_360M => "https://huggingface.co/bartowski/SmolLM2-360M-Instruct-GGUF/resolve/main/SmolLM2-360M-Instruct-Q8_0.gguf",
+            LocalLlmModel::Phi3Mini => "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+            LocalLlmModel::Qwen2_5_3B => "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
+        }
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            LocalLlmModel::SmolLM2_360M => 386_000_000,    // ~386 MB
+            LocalLlmModel::Phi3Mini => 2_200_000_000,      // ~2.2 GB
+            LocalLlmModel::Qwen2_5_3B => 2_000_000_000,    // ~2.0 GB
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            LocalLlmModel::SmolLM2_360M => "SmolLM2 360M (386 MB) - Rapide",
+            LocalLlmModel::Phi3Mini => "Phi-3 Mini (2.2 GB) - Recommandé",
+            LocalLlmModel::Qwen2_5_3B => "Qwen2.5 3B (2 GB) - Qualité",
+        }
+    }
+
+    /// Format du prompt pour ce modèle
+    pub fn format_prompt(&self, _instruction: &str, text: &str) -> String {
+        match self {
+            LocalLlmModel::SmolLM2_360M => {
+                // SmolLM2 - format ChatML simplifié
+                format!(
+                    "<|im_start|>user\nResume ce texte en 2 phrases:\n\n{}<|im_end|>\n<|im_start|>assistant\n",
+                    text
+                )
+            }
+            LocalLlmModel::Phi3Mini => {
+                // Phi-3 utilise un format spécifique
+                format!(
+                    "<|user|>\nResume ce texte en 2-3 phrases concises en francais:\n\n{}<|end|>\n<|assistant|>\n",
+                    text
+                )
+            }
+            LocalLlmModel::Qwen2_5_3B => {
+                // Qwen2.5 - format ChatML
+                format!(
+                    "<|im_start|>user\nResume ce texte en 2-3 phrases concises:\n\n{}<|im_end|>\n<|im_start|>assistant\n",
+                    text
+                )
+            }
+        }
+    }
+}
+
+// Alias pour compatibilité
+pub type QwenModelSize = LocalLlmModel;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DictationMode {
@@ -249,12 +334,20 @@ pub struct AppSettings {
     pub translation_target_language: String,
     #[serde(default = "default_hotkey_translate")]
     pub hotkey_translate: String,
+    #[serde(default = "default_hotkey_voice_action")]
+    pub hotkey_voice_action: String,
     #[serde(default)]
     pub engine_type: EngineType,
     #[serde(default)]
     pub vosk_language: Option<VoskLanguage>,
     #[serde(default)]
     pub parakeet_model: ParakeetModelSize,
+    #[serde(default)]
+    pub groq_api_key: Option<String>,
+    #[serde(default)]
+    pub llm_provider: LlmProvider,
+    #[serde(default)]
+    pub local_llm_model: LocalLlmModel,
 }
 
 fn default_true() -> bool {
@@ -266,15 +359,19 @@ fn default_translation_language() -> String {
 }
 
 fn default_hotkey_translate() -> String {
-    "CommandOrControl+Shift+T".to_string()
+    "Control+Alt+T".to_string()
+}
+
+fn default_hotkey_voice_action() -> String {
+    "Control+Alt+A".to_string()
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             microphone_id: None,
-            hotkey_push_to_talk: "CommandOrControl+Shift+Space".to_string(),
-            hotkey_toggle_record: "CommandOrControl+Shift+R".to_string(),
+            hotkey_push_to_talk: "Control+Space".to_string(),
+            hotkey_toggle_record: "Control+Shift+R".to_string(),
             transcription_language: "fr".to_string(),
             auto_detect_language: false,
             theme: "system".to_string(),
@@ -292,10 +389,14 @@ impl Default for AppSettings {
             floating_window_position: None,
             translation_enabled: true,
             translation_target_language: "en".to_string(),
-            hotkey_translate: "CommandOrControl+Shift+T".to_string(),
+            hotkey_translate: "Control+Alt+T".to_string(),
+            hotkey_voice_action: "Control+Alt+A".to_string(),
             engine_type: EngineType::default(),
             vosk_language: None,
             parakeet_model: ParakeetModelSize::default(),
+            groq_api_key: None,
+            llm_provider: LlmProvider::default(),
+            local_llm_model: LocalLlmModel::default(),
         }
     }
 }

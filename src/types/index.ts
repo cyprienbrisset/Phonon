@@ -25,6 +25,20 @@ export interface ParakeetModelInfo {
 
 export type LlmMode = 'off' | 'basic' | 'smart' | 'contextual';
 
+export type LlmProvider = 'groq' | 'local';
+
+export type LocalLlmModel = 'smollm2_360m' | 'phi3_mini' | 'qwen2_5_3b';
+
+export interface LocalLlmModelInfo {
+  size: LocalLlmModel;
+  display_name: string;
+  available: boolean;
+  size_bytes: number;
+}
+
+// Aliases for backward compatibility
+export type QwenModelSize = LocalLlmModel;
+
 export type DictationMode = 'general' | 'email' | 'code' | 'notes';
 
 export interface ModelInfo {
@@ -54,6 +68,9 @@ export interface AppSettings {
   engine_type: EngineType;
   vosk_language: VoskLanguage | null;
   parakeet_model: ParakeetModelSize;
+  groq_api_key: string | null;
+  llm_provider: LlmProvider;
+  local_llm_model: LocalLlmModel;
   llm_enabled: boolean;
   llm_mode: LlmMode;
   voice_commands_enabled: boolean;
@@ -64,6 +81,7 @@ export interface AppSettings {
   translation_enabled: boolean;
   translation_target_language: string;
   hotkey_translate: string;
+  hotkey_voice_action: string;
 }
 
 export interface VoskModelInfo {
@@ -94,8 +112,24 @@ export interface AudioDevice {
 
 export type TranscriptionStatus = 'idle' | 'recording' | 'processing' | 'completed' | 'error';
 
+export interface GroqQuota {
+  limit_requests: number | null;
+  remaining_requests: number | null;
+  limit_tokens: number | null;
+  remaining_tokens: number | null;
+  reset_requests: string | null;
+  reset_tokens: string | null;
+}
+
 export interface StreamingChunk {
   text: string;
   is_final: boolean;
   duration_seconds: number;
+}
+
+export interface LlmDownloadProgress {
+  model: LocalLlmModel;
+  downloaded: number;
+  total: number;
+  progress: number;
 }

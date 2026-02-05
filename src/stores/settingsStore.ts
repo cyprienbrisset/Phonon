@@ -18,8 +18,8 @@ interface SettingsStore {
 
 const defaultSettings: AppSettings = {
   microphone_id: null,
-  hotkey_push_to_talk: 'CommandOrControl+Shift+Space',
-  hotkey_toggle_record: 'CommandOrControl+Shift+R',
+  hotkey_push_to_talk: 'Control+Space',
+  hotkey_toggle_record: 'Control+Shift+R',
   transcription_language: 'fr',
   auto_detect_language: false,
   theme: 'system',
@@ -30,6 +30,9 @@ const defaultSettings: AppSettings = {
   engine_type: 'whisper',
   vosk_language: null,
   parakeet_model: 'tdt06bv3',
+  groq_api_key: null,
+  llm_provider: 'groq',
+  local_llm_model: 'phi3_mini',
   llm_enabled: false,
   llm_mode: 'basic',
   voice_commands_enabled: true,
@@ -39,7 +42,8 @@ const defaultSettings: AppSettings = {
   floating_window_enabled: false,
   translation_enabled: true,
   translation_target_language: 'en',
-  hotkey_translate: 'CommandOrControl+Shift+T',
+  hotkey_translate: 'Control+Alt+T',
+  hotkey_voice_action: 'Control+Alt+A',
 };
 
 export const useSettingsStore = create<SettingsStore>((set, get) => ({

@@ -11,6 +11,7 @@ pub use audio::AudioCapture;
 pub use types::*;
 
 use engines::SpeechEngine;
+use llm::LocalLlmEngine;
 use state::AppState;
 use tauri::{
     image::Image,
@@ -21,15 +22,21 @@ use tauri::{
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::process::{Command, Stdio};
+use tokio::sync::RwLock;
 
 // Raccourcis globaux
 static PTT_SHORTCUT: Mutex<Option<Shortcut>> = Mutex::new(None);
 static TRANSLATE_SHORTCUT: Mutex<Option<Shortcut>> = Mutex::new(None);
+static VOICE_ACTION_SHORTCUT: Mutex<Option<Shortcut>> = Mutex::new(None);
 
 // État global pour le push-to-talk
 static IS_PTT_ACTIVE: AtomicBool = AtomicBool::new(false);
+// État global pour le voice action (texte sélectionné + instruction vocale)
+static IS_VOICE_ACTION_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Texte sélectionné pour le voice action
+static SELECTED_TEXT_FOR_ACTION: Mutex<String> = Mutex::new(String::new());
 
 // Channel pour envoyer les données audio du thread d'enregistrement
 static PTT_AUDIO_SENDER: Mutex<Option<mpsc::Sender<PttCommand>>> = Mutex::new(None);
@@ -44,6 +51,17 @@ static TRAY_ICON: Mutex<Option<TrayIcon>> = Mutex::new(None);
 // Icônes en cache
 static ICON_DEFAULT: Mutex<Option<Image<'static>>> = Mutex::new(None);
 static ICON_RECORDING: Mutex<Option<Image<'static>>> = Mutex::new(None);
+static ICON_TRANSLATING: Mutex<Option<Image<'static>>> = Mutex::new(None);
+static ICON_VOICE_ACTION: Mutex<Option<Image<'static>>> = Mutex::new(None);
+
+/// État du tray icon
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrayState {
+    Idle,
+    Recording,    // Rouge - transcription PTT
+    Translating,  // Bleu - traduction en cours
+    VoiceAction,  // Jaune - voice action en cours
+}
 
 #[derive(Debug)]
 enum PttCommand {
@@ -73,6 +91,13 @@ fn parse_hotkey(hotkey: &str) -> Option<Shortcut> {
         match part_lower.as_str() {
             "ctrl" | "control" => modifiers |= Modifiers::CONTROL,
             "cmd" | "command" | "meta" => modifiers |= Modifiers::META,
+            // "CommandOrControl" -> Cmd sur macOS, Ctrl sur Windows/Linux
+            "commandorcontrol" => {
+                #[cfg(target_os = "macos")]
+                { modifiers |= Modifiers::META; }
+                #[cfg(not(target_os = "macos"))]
+                { modifiers |= Modifiers::CONTROL; }
+            }
             "alt" | "option" => modifiers |= Modifiers::ALT,
             "shift" => modifiers |= Modifiers::SHIFT,
             _ => {
@@ -147,9 +172,8 @@ fn parse_hotkey(hotkey: &str) -> Option<Shortcut> {
     })
 }
 
-/// Génère une icône d'enregistrement (cercle rouge)
-fn create_recording_icon() -> Image<'static> {
-    // Créer une icône 32x32 avec un cercle rouge
+/// Génère une icône circulaire avec une couleur spécifique
+fn create_colored_icon(r: u8, g: u8, b: u8) -> Image<'static> {
     let size = 32;
     let mut rgba = vec![0u8; size * size * 4];
 
@@ -164,17 +188,16 @@ fn create_recording_icon() -> Image<'static> {
 
             let idx = (y * size + x) * 4;
             if dist <= radius {
-                // Rouge vif
-                rgba[idx] = 255;     // R
-                rgba[idx + 1] = 51;  // G
-                rgba[idx + 2] = 102; // B
-                rgba[idx + 3] = 255; // A
+                rgba[idx] = r;
+                rgba[idx + 1] = g;
+                rgba[idx + 2] = b;
+                rgba[idx + 3] = 255;
             } else if dist <= radius + 1.0 {
                 // Anti-aliasing
                 let alpha = ((radius + 1.0 - dist) * 255.0) as u8;
-                rgba[idx] = 255;
-                rgba[idx + 1] = 51;
-                rgba[idx + 2] = 102;
+                rgba[idx] = r;
+                rgba[idx + 1] = g;
+                rgba[idx + 2] = b;
                 rgba[idx + 3] = alpha;
             }
         }
@@ -183,45 +206,51 @@ fn create_recording_icon() -> Image<'static> {
     Image::new_owned(rgba, size as u32, size as u32)
 }
 
-/// Change l'icône du tray
-fn set_tray_recording(recording: bool) {
-    println!("[TRAY] set_tray_recording({})", recording);
+/// Icône rouge pour l'enregistrement/transcription
+fn create_recording_icon() -> Image<'static> {
+    create_colored_icon(255, 59, 48) // Rouge Apple
+}
+
+/// Icône bleue pour la traduction
+fn create_translating_icon() -> Image<'static> {
+    create_colored_icon(0, 122, 255) // Bleu Apple
+}
+
+/// Icône jaune/orange pour le voice action
+fn create_voice_action_icon() -> Image<'static> {
+    create_colored_icon(255, 179, 0) // Jaune/Orange Apple
+}
+
+/// Change l'icône du tray selon l'état
+fn set_tray_state(state: TrayState) {
+    println!("[TRAY] set_tray_state({:?})", state);
 
     match TRAY_ICON.lock() {
         Ok(guard) => {
             if let Some(ref tray) = *guard {
                 println!("[TRAY] Got tray reference");
-                let icon = if recording {
-                    match ICON_RECORDING.lock() {
-                        Ok(guard) => {
-                            println!("[TRAY] Got recording icon: {:?}", guard.is_some());
-                            guard.clone()
-                        }
-                        Err(e) => {
-                            println!("[TRAY] Failed to lock ICON_RECORDING: {:?}", e);
-                            None
-                        }
+                let icon = match state {
+                    TrayState::Idle => {
+                        ICON_DEFAULT.lock().ok().and_then(|g| g.clone())
                     }
-                } else {
-                    match ICON_DEFAULT.lock() {
-                        Ok(guard) => {
-                            println!("[TRAY] Got default icon: {:?}", guard.is_some());
-                            guard.clone()
-                        }
-                        Err(e) => {
-                            println!("[TRAY] Failed to lock ICON_DEFAULT: {:?}", e);
-                            None
-                        }
+                    TrayState::Recording => {
+                        ICON_RECORDING.lock().ok().and_then(|g| g.clone())
+                    }
+                    TrayState::Translating => {
+                        ICON_TRANSLATING.lock().ok().and_then(|g| g.clone())
+                    }
+                    TrayState::VoiceAction => {
+                        ICON_VOICE_ACTION.lock().ok().and_then(|g| g.clone())
                     }
                 };
 
                 if let Some(icon) = icon {
                     match tray.set_icon(Some(icon)) {
-                        Ok(_) => println!("[TRAY] Icon changed successfully"),
+                        Ok(_) => println!("[TRAY] Icon changed to {:?}", state),
                         Err(e) => println!("[TRAY] Failed to set icon: {:?}", e),
                     }
                 } else {
-                    println!("[TRAY] No icon to set");
+                    println!("[TRAY] No icon for state {:?}", state);
                 }
             } else {
                 println!("[TRAY] TRAY_ICON is None");
@@ -231,6 +260,11 @@ fn set_tray_recording(recording: bool) {
             println!("[TRAY] Failed to lock TRAY_ICON: {:?}", e);
         }
     }
+}
+
+/// Raccourci pour compatibilité
+fn set_tray_recording(recording: bool) {
+    set_tray_state(if recording { TrayState::Recording } else { TrayState::Idle });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -254,6 +288,9 @@ pub fn run() {
                         .and_then(|guard| guard.as_ref().map(|s| *s == *shortcut))
                         .unwrap_or(false);
                     let is_translate = TRANSLATE_SHORTCUT.lock().ok()
+                        .and_then(|guard| guard.as_ref().map(|s| *s == *shortcut))
+                        .unwrap_or(false);
+                    let is_voice_action = VOICE_ACTION_SHORTCUT.lock().ok()
                         .and_then(|guard| guard.as_ref().map(|s| *s == *shortcut))
                         .unwrap_or(false);
 
@@ -302,6 +339,29 @@ pub fn run() {
                                 translate_clipboard_and_paste(&handle);
                             });
                         }
+                    } else if is_voice_action {
+                        // Voice Action: sélectionner du texte + instruction vocale
+                        match event.state() {
+                            ShortcutState::Pressed => {
+                                println!("[VOICE_ACTION] Key PRESSED - Copying selection and starting recording");
+                                if !IS_VOICE_ACTION_ACTIVE.swap(true, Ordering::SeqCst) {
+                                    let handle = app.clone();
+                                    // Copier le texte sélectionné puis démarrer l'enregistrement
+                                    std::thread::spawn(move || {
+                                        start_voice_action(&handle);
+                                    });
+                                }
+                            }
+                            ShortcutState::Released => {
+                                println!("[VOICE_ACTION] Key RELEASED - Processing");
+                                if IS_VOICE_ACTION_ACTIVE.swap(false, Ordering::SeqCst) {
+                                    let handle = app.clone();
+                                    std::thread::spawn(move || {
+                                        stop_voice_action_and_execute(&handle);
+                                    });
+                                }
+                            }
+                        }
                     }
                 })
                 .build(),
@@ -339,7 +399,15 @@ pub fn run() {
             commands::has_groq_api_key,
             commands::validate_groq_api_key,
             commands::delete_groq_api_key,
+            commands::get_groq_quota,
             commands::translate_text,
+            commands::summarize_text,
+            commands::is_llm_model_available,
+            commands::get_available_llm_models,
+            commands::download_llm_model,
+            commands::delete_llm_model,
+            commands::summarize_text_local,
+            commands::summarize_text_smart,
             commands::auto_paste,
             commands::show_floating_window,
             commands::hide_floating_window,
@@ -360,7 +428,15 @@ pub fn run() {
                 }
             };
 
+            // Gérer le ModelManager séparément pour les commandes LLM
+            let model_manager = app_state.model_manager.clone();
+
             app.manage(app_state);
+            app.manage(model_manager);
+
+            // State pour le moteur LLM local (Mistral)
+            let llm_engine: Arc<RwLock<Option<LocalLlmEngine>>> = Arc::new(RwLock::new(None));
+            app.manage(llm_engine);
 
             // Initialiser le thread audio pour le push-to-talk
             init_ptt_audio_thread();
@@ -397,6 +473,18 @@ pub fn run() {
                         Ok(_) => println!("[TRANSLATE] Shortcut '{}' registered successfully!", translate_hotkey),
                         Err(e) => println!("[TRANSLATE] ERROR registering shortcut: {:?}", e),
                     }
+                }
+            }
+
+            // Raccourci Voice Action (texte sélectionné + instruction vocale)
+            let voice_action_hotkey = settings.hotkey_voice_action.clone();
+            if let Some(voice_action_shortcut) = parse_hotkey(&voice_action_hotkey) {
+                if let Ok(mut guard) = VOICE_ACTION_SHORTCUT.lock() {
+                    *guard = Some(voice_action_shortcut);
+                }
+                match app.global_shortcut().register(voice_action_shortcut) {
+                    Ok(_) => println!("[VOICE_ACTION] Shortcut '{}' registered successfully!", voice_action_hotkey),
+                    Err(e) => println!("[VOICE_ACTION] ERROR registering shortcut: {:?}", e),
                 }
             }
 
@@ -456,11 +544,25 @@ pub fn run() {
                 println!("[TRAY] ICON_DEFAULT stored");
             }
 
-            // Créer et stocker l'icône d'enregistrement
+            // Créer et stocker l'icône d'enregistrement (rouge)
             let recording_icon = create_recording_icon();
             if let Ok(mut guard) = ICON_RECORDING.lock() {
                 *guard = Some(recording_icon);
-                println!("[TRAY] ICON_RECORDING stored");
+                println!("[TRAY] ICON_RECORDING (red) stored");
+            }
+
+            // Créer et stocker l'icône de traduction (bleu)
+            let translating_icon = create_translating_icon();
+            if let Ok(mut guard) = ICON_TRANSLATING.lock() {
+                *guard = Some(translating_icon);
+                println!("[TRAY] ICON_TRANSLATING (blue) stored");
+            }
+
+            // Créer et stocker l'icône de voice action (jaune)
+            let voice_action_icon = create_voice_action_icon();
+            if let Ok(mut guard) = ICON_VOICE_ACTION.lock() {
+                *guard = Some(voice_action_icon);
+                println!("[TRAY] ICON_VOICE_ACTION (yellow) stored");
             }
 
             // Cloner l'icône pour le tray
@@ -1560,6 +1662,10 @@ fn copy_selected_text() {
 fn translate_clipboard_and_paste(app: &tauri::AppHandle) {
     println!("[TRANSLATE] translate_clipboard_and_paste() called");
 
+    // Icône bleue pour indiquer la traduction en cours
+    set_tray_state(TrayState::Translating);
+    let _ = app.emit("translation-status", "translating");
+
     // 0. D'abord, copier le texte sélectionné dans le presse-papiers
     copy_selected_text();
 
@@ -1568,12 +1674,16 @@ fn translate_clipboard_and_paste(app: &tauri::AppHandle) {
         Ok(text) => {
             if text.is_empty() {
                 println!("[TRANSLATE] Clipboard is empty");
+                set_tray_state(TrayState::Idle);
+                let _ = app.emit("translation-status", "idle");
                 return;
             }
             text
         }
         Err(e) => {
             println!("[TRANSLATE] Failed to read clipboard: {}", e);
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("translation-status", "idle");
             return;
         }
     };
@@ -1590,8 +1700,9 @@ fn translate_clipboard_and_paste(app: &tauri::AppHandle) {
         Some(key) => key,
         None => {
             println!("[TRANSLATE] No Groq API key configured");
-            // Notifier l'utilisateur via une notification
+            set_tray_state(TrayState::Idle);
             let _ = app.emit("translation_error", "Clé API Groq non configurée");
+            let _ = app.emit("translation-status", "idle");
             return;
         }
     };
@@ -1631,6 +1742,8 @@ fn translate_clipboard_and_paste(app: &tauri::AppHandle) {
         Ok(rt) => rt,
         Err(e) => {
             println!("[TRANSLATE] Failed to create tokio runtime: {}", e);
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("translation-status", "idle");
             return;
         }
     };
@@ -1655,4 +1768,229 @@ fn translate_clipboard_and_paste(app: &tauri::AppHandle) {
             let _ = app.emit("translation_error", format!("Erreur de traduction: {}", e));
         }
     }
+
+    // Remettre l'icône par défaut
+    set_tray_state(TrayState::Idle);
+    let _ = app.emit("translation-status", "idle");
+}
+
+/// Démarre le Voice Action: copie le texte sélectionné et démarre l'enregistrement
+fn start_voice_action(app: &tauri::AppHandle) {
+    println!("[VOICE_ACTION] Starting voice action...");
+
+    // 1. D'abord copier le texte sélectionné (Cmd+C / Ctrl+C)
+    copy_selected_text();
+
+    // 2. Lire le texte du presse-papier
+    let selected_text = match app.clipboard().read_text() {
+        Ok(text) => {
+            if text.is_empty() {
+                println!("[VOICE_ACTION] No text selected");
+                String::new()
+            } else {
+                println!("[VOICE_ACTION] Selected text: '{}' ({} chars)",
+                    &text[..text.len().min(50)], text.len());
+                text
+            }
+        }
+        Err(e) => {
+            println!("[VOICE_ACTION] Failed to read clipboard: {}", e);
+            String::new()
+        }
+    };
+
+    // 3. Stocker le texte sélectionné
+    if let Ok(mut guard) = SELECTED_TEXT_FOR_ACTION.lock() {
+        *guard = selected_text;
+    }
+
+    // 4. Démarrer l'enregistrement audio avec icône jaune (voice action)
+    set_tray_state(TrayState::VoiceAction);
+    start_ptt_recording();
+
+    // 5. Émettre l'événement de statut
+    let _ = app.emit("voice-action-status", "recording");
+}
+
+/// Arrête le Voice Action: transcrit l'instruction et exécute via Groq
+fn stop_voice_action_and_execute(app: &tauri::AppHandle) {
+    println!("[VOICE_ACTION] Stopping and executing...");
+
+    // Garder l'icône jaune pendant le traitement
+    let _ = app.emit("voice-action-status", "processing");
+
+    // 1. Récupérer le texte sélectionné
+    let selected_text = SELECTED_TEXT_FOR_ACTION.lock()
+        .ok()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+
+    // 2. Arrêter l'enregistrement et récupérer l'audio
+    if let Ok(guard) = PTT_AUDIO_SENDER.lock() {
+        if let Some(ref sender) = *guard {
+            let _ = sender.send(PttCommand::Stop);
+        }
+    }
+
+    let (audio_data, sample_rate) = if let Ok(guard) = PTT_AUDIO_RECEIVER.lock() {
+        if let Some(ref receiver) = *guard {
+            loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(PttResult::AudioComplete { audio, sample_rate }) => break (audio, sample_rate),
+                    Ok(PttResult::AudioSnapshot { .. }) => continue,
+                    Err(e) => {
+                        println!("[VOICE_ACTION] Failed to receive audio: {}", e);
+                        set_tray_state(TrayState::Idle);
+                        let _ = app.emit("voice-action-status", "idle");
+                        return;
+                    }
+                }
+            }
+        } else {
+            println!("[VOICE_ACTION] Audio receiver not initialized");
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    } else {
+        println!("[VOICE_ACTION] Failed to lock audio receiver");
+        set_tray_state(TrayState::Idle);
+        let _ = app.emit("voice-action-status", "idle");
+        return;
+    };
+
+    if audio_data.is_empty() {
+        println!("[VOICE_ACTION] Audio buffer empty");
+        set_tray_state(TrayState::Idle);
+        let _ = app.emit("voice-action-status", "idle");
+        return;
+    }
+
+    let duration = audio_data.len() as f32 / sample_rate as f32;
+    println!("[VOICE_ACTION] Recorded {:.1}s of audio", duration);
+
+    if duration < 0.5 {
+        println!("[VOICE_ACTION] Recording too short");
+        set_tray_state(TrayState::Idle);
+        let _ = app.emit("voice-action-status", "idle");
+        return;
+    }
+
+    // 3. Resampler si nécessaire
+    let resampled = if sample_rate != TARGET_SAMPLE_RATE {
+        resample_audio(&audio_data, sample_rate, TARGET_SAMPLE_RATE)
+    } else {
+        audio_data
+    };
+
+    // 4. Transcrire l'instruction vocale
+    let state: tauri::State<'_, state::AppState> = app.state();
+    let engine_guard = match state.engine.read() {
+        Ok(guard) => guard,
+        Err(e) => {
+            println!("[VOICE_ACTION] Failed to lock engine: {}", e);
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    };
+
+    let engine = match engine_guard.as_ref() {
+        Some(e) => e,
+        None => {
+            println!("[VOICE_ACTION] Engine not initialized");
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    };
+
+    let transcription = match engine.transcribe(&resampled, TARGET_SAMPLE_RATE) {
+        Ok(r) => r.text,
+        Err(e) => {
+            println!("[VOICE_ACTION] Transcription failed: {}", e);
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    };
+
+    drop(engine_guard);
+
+    if transcription.is_empty() {
+        println!("[VOICE_ACTION] No instruction detected");
+        set_tray_state(TrayState::Idle);
+        let _ = app.emit("voice-action-status", "idle");
+        return;
+    }
+
+    println!("[VOICE_ACTION] Instruction: '{}'", transcription);
+
+    // 5. Récupérer la clé API Groq
+    let api_key = match commands::llm::get_groq_api_key_internal() {
+        Some(key) => key,
+        None => {
+            println!("[VOICE_ACTION] No Groq API key");
+            let _ = app.emit("voice-action-error", "Clé API Groq non configurée");
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    };
+
+    // 6. Construire le prompt pour Groq
+    let system_prompt = r#"Tu es un assistant qui exécute des instructions sur du texte.
+L'utilisateur te donne un texte et une instruction vocale.
+Exécute l'instruction demandée sur le texte fourni.
+Retourne UNIQUEMENT le résultat, sans explication ni commentaire."#;
+
+    let user_prompt = if selected_text.is_empty() {
+        // Pas de texte sélectionné, juste l'instruction
+        transcription.clone()
+    } else {
+        format!(
+            "Texte:\n{}\n\nInstruction: {}",
+            selected_text, transcription
+        )
+    };
+
+    println!("[VOICE_ACTION] Sending to Groq...");
+
+    // 7. Appeler Groq
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            println!("[VOICE_ACTION] Failed to create runtime: {}", e);
+            set_tray_state(TrayState::Idle);
+            let _ = app.emit("voice-action-status", "idle");
+            return;
+        }
+    };
+
+    let result = rt.block_on(async {
+        llm::groq_client::send_completion(&api_key, system_prompt, &user_prompt).await
+    });
+
+    match result {
+        Ok(response) => {
+            let trimmed = response.trim().to_string();
+            println!("[VOICE_ACTION] Success: '{}'", &trimmed[..trimmed.len().min(100)]);
+
+            // 8. Coller le résultat
+            paste_text(&trimmed);
+
+            let _ = app.emit("voice-action-complete", &trimmed);
+        }
+        Err(e) => {
+            println!("[VOICE_ACTION] Groq error: {}", e);
+            let _ = app.emit("voice-action-error", format!("Erreur: {}", e));
+        }
+    }
+
+    // Remettre l'icône par défaut
+    set_tray_state(TrayState::Idle);
+    let _ = app.emit("voice-action-status", "idle");
 }

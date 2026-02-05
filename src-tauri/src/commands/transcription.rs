@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, State};
 use serde::Serialize;
@@ -13,18 +13,28 @@ use crate::llm;
 /// Taux d'échantillonnage requis par Whisper
 const TARGET_SAMPLE_RATE: u32 = 16000;
 
+/// Durée d'un chunk en secondes pour le streaming
+const STREAMING_CHUNK_DURATION_SECS: f32 = 2.5;
+
 /// État global pour le streaming
 static STREAMING_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Buffer audio partagé pour le streaming (clone du buffer interne pendant l'enregistrement)
+static STREAMING_BUFFER: Mutex<Option<Arc<RwLock<Vec<f32>>>>> = Mutex::new(None);
+static STREAMING_SAMPLE_RATE: Mutex<u32> = Mutex::new(16000);
 
 /// Channels pour communiquer avec le thread audio
 static AUDIO_CMD_SENDER: Mutex<Option<mpsc::Sender<AudioCommand>>> = Mutex::new(None);
 static AUDIO_RESULT_RECEIVER: Mutex<Option<mpsc::Receiver<AudioResult>>> = Mutex::new(None);
+static AUDIO_SNAPSHOT_SENDER: Mutex<Option<mpsc::Sender<()>>> = Mutex::new(None);
+static AUDIO_SNAPSHOT_RECEIVER: Mutex<Option<mpsc::Receiver<(Vec<f32>, u32)>>> = Mutex::new(None);
 
 /// Commandes pour le thread audio
 #[derive(Debug)]
 enum AudioCommand {
     Start { device_id: Option<String> },
     Stop,
+    GetSnapshot,
 }
 
 /// Résultats du thread audio
@@ -56,6 +66,8 @@ fn emit_streaming_chunk(app: &AppHandle, chunk: StreamingChunkEvent) {
 pub fn init_gui_audio_thread() {
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCommand>();
     let (result_tx, result_rx) = mpsc::channel::<AudioResult>();
+    let (snapshot_req_tx, snapshot_req_rx) = mpsc::channel::<()>();
+    let (snapshot_res_tx, snapshot_res_rx) = mpsc::channel::<(Vec<f32>, u32)>();
 
     // Stocker les channels
     if let Ok(mut guard) = AUDIO_CMD_SENDER.lock() {
@@ -64,6 +76,12 @@ pub fn init_gui_audio_thread() {
     if let Ok(mut guard) = AUDIO_RESULT_RECEIVER.lock() {
         *guard = Some(result_rx);
     }
+    if let Ok(mut guard) = AUDIO_SNAPSHOT_SENDER.lock() {
+        *guard = Some(snapshot_req_tx);
+    }
+    if let Ok(mut guard) = AUDIO_SNAPSHOT_RECEIVER.lock() {
+        *guard = Some(snapshot_res_rx);
+    }
 
     // Thread audio dédié
     std::thread::spawn(move || {
@@ -71,7 +89,18 @@ pub fn init_gui_audio_thread() {
         let mut capture: Option<AudioCapture> = None;
 
         loop {
-            match cmd_rx.recv() {
+            // Vérifier les demandes de snapshot (non-bloquant)
+            if let Ok(()) = snapshot_req_rx.try_recv() {
+                if let Some(ref cap) = capture {
+                    let (audio, sample_rate) = cap.get_audio_snapshot();
+                    let _ = snapshot_res_tx.send((audio, sample_rate));
+                } else {
+                    let _ = snapshot_res_tx.send((vec![], 16000));
+                }
+            }
+
+            // Vérifier les commandes (avec timeout pour permettre les snapshots)
+            match cmd_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(AudioCommand::Start { device_id }) => {
                     log::info!("GUI Audio: Starting capture (device: {:?})", device_id);
                     match AudioCapture::new(device_id.as_deref()) {
@@ -108,7 +137,18 @@ pub fn init_gui_audio_thread() {
                         let _ = result_tx.send(AudioResult { audio: vec![], sample_rate: 16000 });
                     }
                 }
-                Err(_) => {
+                Ok(AudioCommand::GetSnapshot) => {
+                    if let Some(ref cap) = capture {
+                        let (audio, sample_rate) = cap.get_audio_snapshot();
+                        let _ = snapshot_res_tx.send((audio, sample_rate));
+                    } else {
+                        let _ = snapshot_res_tx.send((vec![], 16000));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Continue la boucle pour vérifier les snapshots
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
                     log::info!("GUI audio thread: channel closed, exiting");
                     break;
                 }
@@ -148,8 +188,9 @@ pub fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(),
     // Démarrer la tâche de streaming si activée
     if streaming_enabled {
         let app_clone = app.clone();
+        let engine_clone = state.engine.clone();
         std::thread::spawn(move || {
-            run_streaming_task(app_clone);
+            run_streaming_task(app_clone, engine_clone);
         });
     }
 
@@ -157,12 +198,13 @@ pub fn start_recording(app: AppHandle, state: State<'_, AppState>) -> Result<(),
     Ok(())
 }
 
-/// Tâche de streaming qui émet des événements de progression pendant l'enregistrement
-fn run_streaming_task(app: AppHandle) {
-    log::info!("Streaming task started");
+/// Tâche de streaming qui transcrit l'audio en temps réel
+fn run_streaming_task(app: AppHandle, state: Arc<RwLock<Option<Box<dyn SpeechEngine>>>>) {
+    log::info!("Streaming task started with real-time transcription");
 
     let start_time = std::time::Instant::now();
-    let mut last_emitted_duration = 0.0f32;
+    let mut last_processed_samples: usize = 0;
+    let chunk_samples = (STREAMING_CHUNK_DURATION_SECS * TARGET_SAMPLE_RATE as f32) as usize;
 
     while STREAMING_ACTIVE.load(Ordering::SeqCst) {
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -171,15 +213,72 @@ fn run_streaming_task(app: AppHandle) {
             break;
         }
 
-        let elapsed = start_time.elapsed().as_secs_f32();
+        // Demander un snapshot audio
+        let snapshot = {
+            let guard = AUDIO_SNAPSHOT_SENDER.lock().ok();
+            let receiver_guard = AUDIO_SNAPSHOT_RECEIVER.lock().ok();
 
-        if elapsed - last_emitted_duration >= 0.5 {
-            emit_streaming_chunk(&app, StreamingChunkEvent {
-                text: String::new(),
-                is_final: false,
-                duration_seconds: elapsed,
-            });
-            last_emitted_duration = elapsed;
+            if let (Some(ref sender), Some(ref receiver)) = (guard.as_ref().and_then(|g| g.as_ref()), receiver_guard.as_ref().and_then(|g| g.as_ref())) {
+                if sender.send(()).is_ok() {
+                    receiver.recv_timeout(std::time::Duration::from_millis(500)).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some((audio, sample_rate)) = snapshot {
+            let elapsed = start_time.elapsed().as_secs_f32();
+
+            // Calculer combien de nouveaux échantillons nous avons
+            let current_samples = audio.len();
+            let new_samples = current_samples.saturating_sub(last_processed_samples);
+
+            // Si nous avons assez de nouveaux échantillons pour un chunk
+            if new_samples >= chunk_samples && current_samples >= chunk_samples {
+                // Prendre les derniers samples pour la transcription partielle
+                let chunk_start = current_samples.saturating_sub(chunk_samples);
+                let chunk_audio = &audio[chunk_start..];
+
+                // Resampling si nécessaire
+                let resampled = if sample_rate != TARGET_SAMPLE_RATE {
+                    resample_audio(chunk_audio, sample_rate, TARGET_SAMPLE_RATE)
+                } else {
+                    chunk_audio.to_vec()
+                };
+
+                // Transcrire le chunk
+                if let Ok(engine_guard) = state.read() {
+                    if let Some(ref engine) = *engine_guard {
+                        match engine.transcribe(&resampled, TARGET_SAMPLE_RATE) {
+                            Ok(result) => {
+                                if !result.text.trim().is_empty() {
+                                    log::info!("Streaming chunk: '{}'", result.text);
+                                    emit_streaming_chunk(&app, StreamingChunkEvent {
+                                        text: result.text,
+                                        is_final: false,
+                                        duration_seconds: elapsed,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Streaming transcription error: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                last_processed_samples = current_samples;
+            } else {
+                // Émettre juste la durée pour indiquer que le streaming est actif
+                emit_streaming_chunk(&app, StreamingChunkEvent {
+                    text: String::new(),
+                    is_final: false,
+                    duration_seconds: elapsed,
+                });
+            }
         }
     }
 

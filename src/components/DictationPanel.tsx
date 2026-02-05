@@ -32,10 +32,13 @@ export function DictationPanel() {
     const unlistenChunk = listen<StreamingChunk>('transcription-chunk', (event) => {
       const chunk = event.payload;
       if (chunk.is_final) {
+        // Transcription finale complète
         setStreamingText(chunk.text);
-      } else {
-        setStreamingText((prev) => prev + chunk.text);
+      } else if (chunk.text) {
+        // Nouveau chunk de texte partiel - afficher le dernier segment transcrit
+        setStreamingText(chunk.text);
       }
+      // Les chunks vides (text: '') sont des indicateurs de durée, on les ignore pour le texte
     });
 
     return () => {

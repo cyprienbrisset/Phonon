@@ -20,7 +20,8 @@ impl WhisperEngine {
         }
 
         let mut ctx_params = WhisperContextParameters::default();
-        ctx_params.use_gpu = true;
+        // GPU (Metal/CUDA) only benefits medium+ models; tiny/small are faster on CPU
+        ctx_params.use_gpu = matches!(model_size, ModelSize::Medium);
 
         let ctx = WhisperContext::new_with_params(
             model_path.to_str().ok_or("Invalid model path")?,

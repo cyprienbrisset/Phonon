@@ -59,6 +59,10 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install cmake --installargs '"ADD_CMAKE_TO_PATH=System"' -y
 
+      - name: Set macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> $GITHUB_ENV
+
       - name: Fix whisper.cpp i8mm build on Apple Silicon
         if: matrix.rust-targets == 'aarch64-apple-darwin'
         run: |

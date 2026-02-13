@@ -10,6 +10,7 @@ import { useTranscriptionStore } from './stores/transcriptionStore';
 import { useHotkeys } from './hooks/useHotkeys';
 import { GroqQuota } from './types';
 import logoSvg from './assets/logo.svg';
+import { OnboardingWizard } from './components/onboarding';
 
 type Tab = 'dictation' | 'history' | 'files';
 type AppStatus = 'idle' | 'recording' | 'translating' | 'voice-action';
@@ -102,6 +103,10 @@ function App() {
       invoke('show_floating_window').catch(console.error);
     }
   }, [settings?.floating_window_enabled]);
+
+  if (settings && !settings.onboarding_completed) {
+    return <OnboardingWizard />;
+  }
 
   return (
     <div className="h-screen flex flex-col overflow-hidden relative">
